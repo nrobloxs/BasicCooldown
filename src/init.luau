@@ -2,10 +2,10 @@
 
 local Signal = require(script.Signal)
 
-local Cooldown = {}
-Cooldown.__index = Cooldown
+local Flag = {}
+Flag.__index = Flag
 
-export type Cooldown = typeof(setmetatable(
+export type Flag = typeof(setmetatable(
 	{} :: {
 		_Identifier: string,
 		_Flag: boolean,
@@ -15,13 +15,17 @@ export type Cooldown = typeof(setmetatable(
 		_RevertThread: thread?,
 		_FlaggingThread: thread?,
 		_GetFlagThread: thread?,
+		_RevertAt: number?,
+		_FlaggingAt: number?,
+		_GetFlagAt: number?,
 
-		Verbose: boolean,
+		Verbose: boolean?,
+		Compounding: boolean?,
 		FlaggingDisabled: boolean,
 		GetFlagDisabled: boolean,
 		Signal: typeof(Signal.new()),
 	},
-	Cooldown
+	Flag
 ))
 
 local function CancelThread(Thread: thread?)
@@ -38,42 +42,47 @@ local function Format(Message: string, ...: any): string
 	return string.format(Message, table.unpack(Args, 1, Args.n))
 end
 
-local function Log(self: Cooldown, Message: string, ...: any)
+local function Log(self: Flag, Message: string, ...: any)
 	if self.Verbose then
-		print(Format("[Cooldown:%s] " .. Message, self._Identifier, ...))
+		print(Format("[Flag:%s] " .. Message, self._Identifier, ...))
 	end
 end
 
-local function Warn(self: Cooldown, Message: string, ...: any)
+local function Warn(self: Flag, Message: string, ...: any)
 	if self.Verbose then
-		warn(Format("[Cooldown:%s] " .. Message, self._Identifier, ...))
+		warn(Format("[Flag:%s] " .. Message, self._Identifier, ...))
 	end
 end
 
-function Cooldown.new(
+function Flag.new(
 	Identifier: string,
 	InitialFlagValue: boolean?,
 	FlaggingDisabled: boolean?,
 	GetFlagDisabled: boolean?,
-	Verbose: boolean?
-): Cooldown
-	assert(type(Identifier) == "string", "Cooldown.new: Identifier must be a string")
+	Verbose: boolean?,
+	Compounding: boolean?
+): Flag
+	assert(type(Identifier) == "string", "Flag.new: Identifier must be a string")
 
 	local Initial = InitialFlagValue or false
 	local self = setmetatable({
 		_Identifier = Identifier,
 		_Flag = Initial,
-		_FlagPrev = false,
+		_FlagPrev = Initial,
 		_RevertTo = Initial,
 		_Destroyed = false,
 		_RevertThread = nil,
 		_FlaggingThread = nil,
 		_GetFlagThread = nil,
+		_RevertAt = nil,
+		_FlaggingAt = nil,
+		_GetFlagAt = nil,
 		Verbose = Verbose or false,
+		Compounding = Compounding or false,
 		FlaggingDisabled = FlaggingDisabled or false,
 		GetFlagDisabled = GetFlagDisabled or false,
 		Signal = Signal.new(),
-	}, Cooldown) :: Cooldown
+	}, Flag) :: Flag
 
 	Log(
 		self,
@@ -85,12 +94,12 @@ function Cooldown.new(
 	return self
 end
 
-function Cooldown.SetVerbose(self: Cooldown, Value: boolean)
+function Flag.SetVerbose(self: Flag, Value: boolean)
 	self.Verbose = Value
 	Log(self, "Verbose set to %s", Value)
 end
 
-function Cooldown.GetFlag(self: Cooldown, Type: "now" | "prev", Default: boolean?): boolean?
+function Flag.Get(self: Flag, Type: "now" | "prev", Default: boolean?): boolean?
 	if self._Destroyed then
 		Warn(self, "GetFlag(%s) blocked: destroyed, returning default %s", Type, Default)
 		return Default
@@ -111,8 +120,12 @@ function Cooldown.GetFlag(self: Cooldown, Type: "now" | "prev", Default: boolean
 	return Result
 end
 
-function Cooldown.ListenSignal(
-	self: Cooldown,
+function Flag.GetRemaining(self: Flag): number
+	return self._RevertAt and math.max(0, self._RevertAt - os.clock()) or 0
+end
+
+function Flag.ListenSignal(
+	self: Flag,
 	Callback: (Value: boolean, Previous: boolean) -> ()
 ): typeof(Signal.new():Connect(function() end))?
 	if self._Destroyed then
@@ -123,8 +136,8 @@ function Cooldown.ListenSignal(
 	return self.Signal:Connect(Callback)
 end
 
-function Cooldown.ListenSignalOnce(
-	self: Cooldown,
+function Flag.ListenSignalOnce(
+	self: Flag,
 	Callback: (Value: boolean, Previous: boolean) -> ()
 ): typeof(Signal.new():Connect(function() end))?
 	if self._Destroyed then
@@ -142,7 +155,8 @@ function Cooldown.ListenSignalOnce(
 	return Connection
 end
 
-function Cooldown.SetFlag(self: Cooldown, Value: boolean, RevertDelay: number?): boolean
+function Flag.Set(self: Flag, Value: boolean, RevertDelay: number?, MaxDelay: number?): boolean
+	assert(RevertDelay == nil or (RevertDelay == RevertDelay and RevertDelay >= 0), "bad RevertDelay")
 	if self._Destroyed then
 		Warn(self, "SetFlag(%s, %s) blocked: destroyed", Value, RevertDelay)
 		return false
@@ -164,8 +178,23 @@ function Cooldown.SetFlag(self: Cooldown, Value: boolean, RevertDelay: number?):
 		return false
 	end
 
+	local Deadline = RevertDelay and (os.clock() + RevertDelay)
+	if self.Compounding and Refreshing and RevertDelay and self._RevertAt then
+		Deadline = self._RevertAt + RevertDelay
+		if MaxDelay then
+			Deadline = math.max(self._RevertAt, math.min(Deadline, os.clock() + MaxDelay))
+		end
+		RevertDelay = math.max(0, Deadline - os.clock())
+	end
+	if Refreshing and Deadline and self._RevertAt and Deadline < self._RevertAt then
+		return false
+	end
+
 	if not Refreshing then
-		self._RevertTo = self._Flag
+		if not self._RevertThread then
+			self._RevertTo = self._Flag
+		end
+
 		self._FlagPrev = self._Flag
 		self._Flag = Value
 		Log(self, "Flag changed %s -> %s", self._FlagPrev, self._Flag)
@@ -178,12 +207,19 @@ function Cooldown.SetFlag(self: Cooldown, Value: boolean, RevertDelay: number?):
 	end
 	CancelThread(self._RevertThread)
 	self._RevertThread = nil
+	self._RevertAt = nil
 
 	if RevertDelay then
 		local RevertTo = self._RevertTo
+		self._RevertAt = Deadline
 		Log(self, "Revert to %s scheduled in %ss", RevertTo, RevertDelay)
 		self._RevertThread = task.delay(RevertDelay, function()
 			self._RevertThread = nil
+			self._RevertAt = nil
+			if self._Flag == RevertTo then
+				Log(self, "Revert skipped, already %s", RevertTo)
+				return
+			end
 			self._FlagPrev = self._Flag
 			self._Flag = RevertTo
 			Log(self, "Revert fired %s -> %s", self._FlagPrev, self._Flag)
@@ -199,28 +235,44 @@ function Cooldown.SetFlag(self: Cooldown, Value: boolean, RevertDelay: number?):
 	return true
 end
 
-function Cooldown.DisableFlagging(self: Cooldown, RevertDelay: number?): boolean
+function Flag.DisableFlagging(self: Flag, RevertDelay: number?, MaxDelay: number?): boolean
 	if self._Destroyed then
 		Warn(self, "DisableFlagging blocked: destroyed")
 		return false
 	end
-	if self.FlaggingDisabled and not (RevertDelay and self._FlaggingThread) then
-		Log(self, "DisableFlagging(%s) ignored: already disabled with no pending timer to refresh", RevertDelay)
+	if self.FlaggingDisabled and not self._FlaggingThread then
+		Log(self, "DisableFlagging ignored: already permanently disabled")
 		return false
 	end
 
+	local Deadline = RevertDelay and (os.clock() + RevertDelay)
+	local Pending = self._FlaggingAt
+	if RevertDelay and Pending then
+		if self.Compounding then
+			Deadline = Pending + RevertDelay
+			if MaxDelay then
+				Deadline = math.max(Pending, math.min(Deadline, os.clock() + MaxDelay))
+			end
+			RevertDelay = math.max(0, Deadline - os.clock())
+		elseif Deadline and Deadline < Pending then
+			return false
+		end
+	end
 	self.FlaggingDisabled = true
 	if self._FlaggingThread then
 		Log(self, "Cancelled previous flagging timer")
 	end
 	CancelThread(self._FlaggingThread)
 	self._FlaggingThread = nil
+	self._FlaggingAt = nil
 	Log(self, "Flagging disabled")
 
 	if RevertDelay then
+		self._FlaggingAt = Deadline
 		Log(self, "Flagging re-enable scheduled in %ss", RevertDelay)
 		self._FlaggingThread = task.delay(RevertDelay, function()
 			self._FlaggingThread = nil
+			self._FlaggingAt = nil
 			self.FlaggingDisabled = false
 			Log(self, "Flagging re-enabled by timer")
 		end)
@@ -229,7 +281,7 @@ function Cooldown.DisableFlagging(self: Cooldown, RevertDelay: number?): boolean
 	return true
 end
 
-function Cooldown.EnableFlagging(self: Cooldown): boolean
+function Flag.EnableFlagging(self: Flag): boolean
 	if self._Destroyed then
 		Warn(self, "EnableFlagging blocked: destroyed")
 		return false
@@ -241,21 +293,37 @@ function Cooldown.EnableFlagging(self: Cooldown): boolean
 	if self._FlaggingThread then
 		Log(self, "Cancelled pending flagging timer")
 	end
+
 	CancelThread(self._FlaggingThread)
 	self._FlaggingThread = nil
+	self._FlaggingAt = nil
 	self.FlaggingDisabled = false
 	Log(self, "Flagging enabled")
 	return true
 end
 
-function Cooldown.DisableGettingFlag(self: Cooldown, RevertDelay: number?): boolean
+function Flag.DisableGettingFlag(self: Flag, RevertDelay: number?, MaxDelay: number?): boolean
 	if self._Destroyed then
 		Warn(self, "DisableGettingFlag blocked: destroyed")
 		return false
 	end
-	if self.GetFlagDisabled and not (RevertDelay and self._GetFlagThread) then
-		Log(self, "DisableGettingFlag(%s) ignored: already disabled with no pending timer to refresh", RevertDelay)
+	if self.GetFlagDisabled and not self._GetFlagThread then
+		Log(self, "DisableGettingFlag ignored: already permanently disabled")
 		return false
+	end
+
+	local Deadline = RevertDelay and (os.clock() + RevertDelay)
+	local Pending = self._GetFlagAt
+	if RevertDelay and Pending then
+		if self.Compounding then
+			Deadline = Pending + RevertDelay
+			if MaxDelay then
+				Deadline = math.max(Pending, math.min(Deadline, os.clock() + MaxDelay))
+			end
+			RevertDelay = math.max(0, Deadline - os.clock())
+		elseif Deadline and Deadline < Pending then
+			return false
+		end
 	end
 
 	self.GetFlagDisabled = true
@@ -264,12 +332,15 @@ function Cooldown.DisableGettingFlag(self: Cooldown, RevertDelay: number?): bool
 	end
 	CancelThread(self._GetFlagThread)
 	self._GetFlagThread = nil
+	self._GetFlagAt = nil
 	Log(self, "Getting flag disabled")
 
 	if RevertDelay then
+		self._GetFlagAt = Deadline
 		Log(self, "Getting flag re-enable scheduled in %ss", RevertDelay)
 		self._GetFlagThread = task.delay(RevertDelay, function()
 			self._GetFlagThread = nil
+			self._GetFlagAt = nil
 			self.GetFlagDisabled = false
 			Log(self, "Getting flag re-enabled by timer")
 		end)
@@ -278,7 +349,7 @@ function Cooldown.DisableGettingFlag(self: Cooldown, RevertDelay: number?): bool
 	return true
 end
 
-function Cooldown.EnableGettingFlag(self: Cooldown): boolean
+function Flag.EnableGettingFlag(self: Flag): boolean
 	if self._Destroyed then
 		Warn(self, "EnableGettingFlag blocked: destroyed")
 		return false
@@ -292,12 +363,13 @@ function Cooldown.EnableGettingFlag(self: Cooldown): boolean
 	end
 	CancelThread(self._GetFlagThread)
 	self._GetFlagThread = nil
+	self._GetFlagAt = nil
 	self.GetFlagDisabled = false
 	Log(self, "Getting flag enabled")
 	return true
 end
 
-function Cooldown.Destroy(self: Cooldown)
+function Flag.Destroy(self: Flag)
 	if self._Destroyed then
 		Warn(self, "Destroy ignored: already destroyed")
 		return
@@ -311,6 +383,9 @@ function Cooldown.Destroy(self: Cooldown)
 	self._RevertThread = nil
 	self._FlaggingThread = nil
 	self._GetFlagThread = nil
+	self._RevertAt = nil
+	self._FlaggingAt = nil
+	self._GetFlagAt = nil
 	Log(self, "All timers cancelled")
 
 	self._Flag = false
@@ -321,4 +396,4 @@ function Cooldown.Destroy(self: Cooldown)
 	Log(self, "Signal listeners disconnected, destroyed")
 end
 
-return Cooldown
+return Flag
